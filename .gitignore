@@ -1,0 +1,27 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.dll
+*.exe
+*.pdb
+
+## IDE
+.vs/
+.vscode/
+*.sln.docstates
+
+## Build outputs
+publish/
+out/
+
+## App data
+data/
+logs/
+*.db
+
+## Config (contains credentials)
+appsettings.json
+appsettings.jsonc
