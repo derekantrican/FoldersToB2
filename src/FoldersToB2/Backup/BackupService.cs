@@ -72,9 +72,17 @@ public class BackupService
                 ProgressChanged?.Invoke(i + 1, changedFiles.Count);
                 StatusChanged?.Invoke($"Uploading {i + 1}/{changedFiles.Count}: {Path.GetFileName(localPath)}");
 
+                var fileProgress = new Progress<(long BytesUploaded, long TotalBytes)>(p =>
+                {
+                    var pct = p.TotalBytes > 0 ? (double)p.BytesUploaded / p.TotalBytes * 100 : 0;
+                    var uploaded = FormatBytes(p.BytesUploaded);
+                    var total = FormatBytes(p.TotalBytes);
+                    StatusChanged?.Invoke($"Uploading {i + 1}/{changedFiles.Count}: {Path.GetFileName(localPath)} — {uploaded} / {total} ({pct:F1}%)");
+                });
+
                 try
                 {
-                    var result = await UploadWithRetryAsync(b2, b2FileName, localPath, ct);
+                    var result = await UploadWithRetryAsync(b2, b2FileName, localPath, ct, progress: fileProgress);
 
                     var fileInfo = new FileInfo(localPath);
                     _manifest.UpsertRecord(new FileRecord
@@ -347,13 +355,13 @@ public class BackupService
     }
 
     private static async Task<B2FileResponse> UploadWithRetryAsync(
-        B2Client b2, string b2FileName, string localPath, CancellationToken ct, int maxRetries = 3)
+        B2Client b2, string b2FileName, string localPath, CancellationToken ct, int maxRetries = 3, IProgress<(long BytesUploaded, long TotalBytes)>? progress = null)
     {
         for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
             try
             {
-                return await b2.UploadFileAsync(b2FileName, localPath, ct);
+                return await b2.UploadFileAsync(b2FileName, localPath, ct, progress);
             }
             catch (HttpRequestException ex) when (attempt < maxRetries)
             {
@@ -386,6 +394,14 @@ public class BackupService
         var errorCode = ex.HResult & 0xFFFF;
         return errorCode is 32 or 33; // ERROR_SHARING_VIOLATION or ERROR_LOCK_VIOLATION
     }
+
+    private static string FormatBytes(long bytes) => bytes switch
+    {
+        >= 1_073_741_824 => $"{bytes / 1_073_741_824.0:F1} GB",
+        >= 1_048_576 => $"{bytes / 1_048_576.0:F1} MB",
+        >= 1_024 => $"{bytes / 1_024.0:F1} KB",
+        _ => $"{bytes} B"
+    };
 
     private async Task NotifyErrorAsync(string message, string description)
     {

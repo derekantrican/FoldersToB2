@@ -8,7 +8,7 @@ namespace FoldersToB2.B2;
 
 public class B2Client : IDisposable
 {
-    private readonly HttpClient _http = new();
+    private readonly HttpClient _http = new() { Timeout = Timeout.InfiniteTimeSpan };
     private readonly string _keyId;
     private readonly string _key;
     private readonly string _bucketId;
@@ -51,13 +51,13 @@ public class B2Client : IDisposable
             throw new InvalidOperationException("Not authorized. Call AuthorizeAsync first.");
     }
 
-    public async Task<B2FileResponse> UploadFileAsync(string b2FileName, string localFilePath, CancellationToken ct = default)
+    public async Task<B2FileResponse> UploadFileAsync(string b2FileName, string localFilePath, CancellationToken ct = default, IProgress<(long BytesUploaded, long TotalBytes)>? progress = null)
     {
         EnsureAuthorized();
 
         var fileInfo = new FileInfo(localFilePath);
         if (fileInfo.Length >= RecommendedPartSize)
-            return await UploadLargeFileAsync(b2FileName, localFilePath, ct);
+            return await UploadLargeFileAsync(b2FileName, localFilePath, ct, progress);
 
         // Get upload URL
         var uploadUrl = await GetUploadUrlAsync(ct);
@@ -87,7 +87,7 @@ public class B2Client : IDisposable
             ?? throw new InvalidOperationException("Failed to deserialize upload response");
     }
 
-    private async Task<B2FileResponse> UploadLargeFileAsync(string b2FileName, string localFilePath, CancellationToken ct)
+    private async Task<B2FileResponse> UploadLargeFileAsync(string b2FileName, string localFilePath, CancellationToken ct, IProgress<(long BytesUploaded, long TotalBytes)>? progress = null)
     {
         EnsureAuthorized();
 
@@ -106,6 +106,8 @@ public class B2Client : IDisposable
 
         Log.Information("Starting large file upload: {FileName} ({Parts} parts, {Size} bytes)",
             b2FileName, partCount, fileLength);
+
+        long totalBytesUploaded = 0;
 
         try
         {
@@ -132,13 +134,21 @@ public class B2Client : IDisposable
                 request.Headers.TryAddWithoutValidation("X-Bz-Part-Number", partNumber.ToString());
                 request.Headers.TryAddWithoutValidation("X-Bz-Content-Sha1", sha1);
 
-                request.Content = new ByteArrayContent(buffer);
+                var bytesBeforePart = totalBytesUploaded;
+                var progressStream = new ProgressStream(new MemoryStream(buffer), bytesWritten =>
+                {
+                    progress?.Report((bytesBeforePart + bytesWritten, fileLength));
+                });
+                request.Content = new StreamContent(progressStream);
                 request.Content.Headers.ContentLength = currentPartSize;
 
                 var response = await _http.SendAsync(request, ct);
                 await EnsureSuccessAsync(response, $"b2_upload_part ({partNumber}/{partCount})");
 
-                Log.Debug("Uploaded part {Part}/{Total} of {FileName}", partNumber, partCount, b2FileName);
+                totalBytesUploaded += currentPartSize;
+                var pctDone = (int)(totalBytesUploaded * 100 / fileLength);
+                progress?.Report((totalBytesUploaded, fileLength));
+                Log.Debug("Uploaded part {Part}/{Total} ({Pct}%) of {FileName}", partNumber, partCount, pctDone, b2FileName);
             }
         }
         catch
@@ -249,4 +259,69 @@ public class B2Client : IDisposable
     }
 
     public void Dispose() => _http.Dispose();
+}
+
+/// <summary>
+/// A stream wrapper that reports bytes read (used by HttpClient to send content).
+/// </summary>
+file class ProgressStream : Stream
+{
+    private readonly Stream _inner;
+    private readonly Action<long> _onBytesRead;
+    private long _totalBytesRead;
+
+    public ProgressStream(Stream inner, Action<long> onBytesRead)
+    {
+        _inner = inner;
+        _onBytesRead = onBytesRead;
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        var bytesRead = _inner.Read(buffer, offset, count);
+        if (bytesRead > 0)
+        {
+            _totalBytesRead += bytesRead;
+            _onBytesRead(_totalBytesRead);
+        }
+        return bytesRead;
+    }
+
+    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+    {
+        var bytesRead = await _inner.ReadAsync(buffer, offset, count, ct);
+        if (bytesRead > 0)
+        {
+            _totalBytesRead += bytesRead;
+            _onBytesRead(_totalBytesRead);
+        }
+        return bytesRead;
+    }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+    {
+        var bytesRead = await _inner.ReadAsync(buffer, ct);
+        if (bytesRead > 0)
+        {
+            _totalBytesRead += bytesRead;
+            _onBytesRead(_totalBytesRead);
+        }
+        return bytesRead;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => _inner.CanSeek;
+    public override bool CanWrite => false;
+    public override long Length => _inner.Length;
+    public override long Position { get => _inner.Position; set => _inner.Position = value; }
+    public override void Flush() => _inner.Flush();
+    public override long Seek(long offset, SeekOrigin origin) => _inner.Seek(offset, origin);
+    public override void SetLength(long value) => _inner.SetLength(value);
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _inner.Dispose();
+        base.Dispose(disposing);
+    }
 }

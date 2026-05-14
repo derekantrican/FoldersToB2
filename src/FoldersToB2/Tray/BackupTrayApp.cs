@@ -100,10 +100,16 @@ public class BackupTrayApp : ApplicationContext
             _trayIcon.Icon = CreateIcon(success ? Color.LimeGreen : Color.Red);
             Log.Information("=== Backup cycle completed ===");
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (_cts?.IsCancellationRequested == true)
         {
             Log.Information("Backup cancelled");
             _trayIcon.Icon = CreateIcon(Color.DodgerBlue);
+        }
+        catch (OperationCanceledException ex)
+        {
+            Log.Error(ex, "Backup failed due to HTTP timeout or unexpected cancellation");
+            _trayIcon.Icon = CreateIcon(Color.Red);
+            _trayIcon.ShowBalloonTip(5000, "Backup Failed", "HTTP timeout during upload", ToolTipIcon.Error);
         }
         catch (Exception ex)
         {
