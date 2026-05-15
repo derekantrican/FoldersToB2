@@ -63,6 +63,7 @@ public class BackupService
         {
             int uploaded = 0;
             int failed = 0;
+            int skipped = 0;
 
             for (int i = 0; i < changedFiles.Count; i++)
             {
@@ -102,7 +103,7 @@ public class BackupService
                 catch (IOException ex) when (IsFileLocked(ex))
                 {
                     Log.Warning("Skipping locked file: {Path} - {Error}", localPath, ex.Message);
-                    failed++;
+                    skipped++;
                 }
                 catch (OperationCanceledException)
                 {
@@ -115,7 +116,9 @@ public class BackupService
                 }
             }
 
-            var summary = $"Uploaded {uploaded}, failed {failed} of {changedFiles.Count} files";
+            var summary = skipped > 0
+                ? $"Uploaded {uploaded}, failed {failed}, skipped {skipped} locked of {changedFiles.Count} files"
+                : $"Uploaded {uploaded}, failed {failed} of {changedFiles.Count} files";
             StatusChanged?.Invoke(summary);
             Log.Information(summary);
 
