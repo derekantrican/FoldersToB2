@@ -11,7 +11,6 @@ public class BackupService
     private readonly BackupConfig _config;
     private readonly FileManifest _manifest;
     private readonly WebhookNotifier? _webhook;
-    private readonly List<string> _tempFiles = new();
 
     public event Action<string>? StatusChanged;
     public event Action<int, int>? ProgressChanged;
@@ -44,8 +43,6 @@ public class BackupService
             return false;
         }
 
-        try
-        {
         // Scan and detect changes
         StatusChanged?.Invoke("Scanning files...");
         var filesToProcess = ScanFiles();
@@ -85,26 +82,7 @@ public class BackupService
 
                 try
                 {
-                    string uploadPath = localPath;
-                    try
-                    {
-                        // Probe for file lock before uploading
-                        using var probe = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-                    }
-                    catch (IOException ex) when (IsFileLocked(ex))
-                    {
-                        if (_config.CopyToTempOnLock)
-                            uploadPath = CopyToTemp(localPath);
-
-                        if (uploadPath == localPath)
-                        {
-                            Log.Warning("Skipping locked file: {Path} - {Error}", localPath, ex.Message);
-                            failed++;
-                            continue;
-                        }
-                    }
-
-                    var result = await UploadWithRetryAsync(b2, b2FileName, uploadPath, ct, progress: fileProgress);
+                    var result = await UploadWithRetryAsync(b2, b2FileName, localPath, ct, progress: fileProgress);
 
                     var fileInfo = new FileInfo(localPath);
                     _manifest.UpsertRecord(new FileRecord
@@ -112,7 +90,7 @@ public class BackupService
                         LocalPath = localPath,
                         B2FileName = b2FileName,
                         B2FileId = result.FileId,
-                        Sha256Hash = ComputeSha256(uploadPath),
+                        Sha256Hash = ComputeSha256(localPath),
                         LastModifiedUtc = fileInfo.LastWriteTimeUtc,
                         FileSize = fileInfo.Length,
                         LastBackedUpUtc = DateTime.UtcNow
@@ -120,6 +98,11 @@ public class BackupService
 
                     uploaded++;
                     Log.Information("Uploaded: {Path} -> {B2Name}", localPath, b2FileName);
+                }
+                catch (IOException ex) when (IsFileLocked(ex))
+                {
+                    Log.Warning("Skipping locked file: {Path} - {Error}", localPath, ex.Message);
+                    failed++;
                 }
                 catch (OperationCanceledException)
                 {
@@ -156,11 +139,6 @@ public class BackupService
 
         StatusChanged?.Invoke("Idle - last backup: " + DateTime.Now.ToString("g"));
         return !hadFailures;
-        }
-        finally
-        {
-            CleanupTempFiles();
-        }
     }
 
     private List<(string LocalPath, string B2FileName)> ScanFiles()
@@ -383,30 +361,9 @@ public class BackupService
                     continue;
 
                 // Size or timestamp changed - verify with SHA256
-                string hashPath = localPath;
-                try
-                {
-                    var currentHash = ComputeSha256(localPath);
-                    if (currentHash != record.Sha256Hash)
-                        changed.Add((localPath, b2FileName));
-                }
-                catch (IOException ex2) when (IsFileLocked(ex2))
-                {
-                    // File is locked - copy to temp and hash that
-                    if (_config.CopyToTempOnLock)
-                        hashPath = CopyToTemp(localPath);
-
-                    if (hashPath != localPath)
-                    {
-                        var currentHash = ComputeSha256(hashPath);
-                        if (currentHash != record.Sha256Hash)
-                            changed.Add((localPath, b2FileName));
-                    }
-                    else
-                    {
-                        Log.Debug("Skipping locked file during scan: {Path}", localPath);
-                    }
-                }
+                var currentHash = ComputeSha256(localPath);
+                if (currentHash != record.Sha256Hash)
+                    changed.Add((localPath, b2FileName));
             }
             catch (IOException ex) when (IsFileLocked(ex))
             {
@@ -469,43 +426,6 @@ public class BackupService
         >= 1_024 => $"{bytes / 1_024.0:F1} KB",
         _ => $"{bytes} B"
     };
-
-    /// <summary>
-    /// Copies a locked file to a temp path using permissive sharing flags.
-    /// Returns the temp path on success, or the original path if the copy also fails.
-    /// </summary>
-    private string CopyToTemp(string lockedFilePath)
-    {
-        try
-        {
-            var tempPath = Path.Combine(Path.GetTempPath(),
-                $"FoldersToB2_{Guid.NewGuid():N}{Path.GetExtension(lockedFilePath)}");
-
-            using var src = new FileStream(lockedFilePath, FileMode.Open, FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            using var dst = File.Create(tempPath);
-            src.CopyTo(dst);
-
-            _tempFiles.Add(tempPath);
-            Log.Information("Copied locked file to temp: {Source} -> {Temp}", lockedFilePath, tempPath);
-            return tempPath;
-        }
-        catch (Exception ex)
-        {
-            Log.Warning("Failed to copy locked file {Path}: {Error}", lockedFilePath, ex.Message);
-            return lockedFilePath;
-        }
-    }
-
-    private void CleanupTempFiles()
-    {
-        foreach (var path in _tempFiles)
-        {
-            try { File.Delete(path); }
-            catch { /* best effort */ }
-        }
-        _tempFiles.Clear();
-    }
 
     private async Task NotifyErrorAsync(string message, string description)
     {

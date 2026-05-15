@@ -62,8 +62,11 @@ public class B2Client : IDisposable
         // Get upload URL
         var uploadUrl = await GetUploadUrlAsync(ct);
 
-        // Read file and compute SHA1
-        var fileBytes = await File.ReadAllBytesAsync(localFilePath, ct);
+        // Read file and compute SHA1 (permissive sharing so we can read files open by other processes)
+        using var readStream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var ms = new MemoryStream();
+        await readStream.CopyToAsync(ms, ct);
+        var fileBytes = ms.ToArray();
         var sha1 = ComputeSha1Hex(fileBytes);
 
         var encodedFileName = EncodeB2FileName(b2FileName);
@@ -111,7 +114,7 @@ public class B2Client : IDisposable
 
         try
         {
-            await using var fileStream = File.OpenRead(localFilePath);
+            await using var fileStream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             for (int partNumber = 1; partNumber <= partCount; partNumber++)
             {
                 ct.ThrowIfCancellationRequested();
