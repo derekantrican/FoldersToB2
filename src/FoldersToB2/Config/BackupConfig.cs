@@ -11,6 +11,7 @@ public class BackupConfig
     public List<string> ExcludeFolders { get; set; } = new();
     public List<string> ExcludeFileTypes { get; set; } = new();
     public bool RespectGitIgnore { get; set; } = true;
+    public bool CopyToTempOnLock { get; set; } = true;
     public string? WebhookUrl { get; set; }
     public int OldVersionRetentionDays { get; set; } = 7;
 }
