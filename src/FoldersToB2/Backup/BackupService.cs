@@ -168,20 +168,30 @@ public class BackupService
         var files = new List<(string, string)>();
 
         // Add individual files
-        foreach (var filePath in _config.Files)
+        foreach (var fileEntry in _config.Files)
         {
+            var (filePath, b2Override) = Config.PathEntry.Parse(fileEntry);
+
             if (!File.Exists(filePath))
             {
                 Log.Warning("Configured file does not exist: {File}", filePath);
                 continue;
             }
 
-            var rootDrive = Path.GetPathRoot(filePath) ?? "";
-            var relativePath = filePath;
-            if (relativePath.StartsWith(rootDrive, StringComparison.OrdinalIgnoreCase))
-                relativePath = relativePath[rootDrive.Length..];
+            string b2FileName;
+            if (b2Override is not null)
+            {
+                b2FileName = b2Override;
+            }
+            else
+            {
+                var rootDrive = Path.GetPathRoot(filePath) ?? "";
+                var relativePath = filePath;
+                if (relativePath.StartsWith(rootDrive, StringComparison.OrdinalIgnoreCase))
+                    relativePath = relativePath[rootDrive.Length..];
+                b2FileName = relativePath.Replace('\\', '/');
+            }
 
-            var b2FileName = relativePath.Replace('\\', '/');
             files.Add((filePath, b2FileName));
         }
 
@@ -192,8 +202,10 @@ public class BackupService
         var excludeFolders = _config.ExcludeFolders
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var folder in _config.Folders)
+        foreach (var folderEntry in _config.Folders)
         {
+            var (folder, b2Override) = Config.PathEntry.Parse(folderEntry);
+
             if (!Directory.Exists(folder))
             {
                 Log.Warning("Configured folder does not exist: {Folder}", folder);
@@ -201,18 +213,30 @@ public class BackupService
             }
 
             var rootDrive = Path.GetPathRoot(folder) ?? "";
+            var folderFullPath = Path.GetFullPath(folder);
 
             foreach (var filePath in EnumerateFilesSafe(folder, excludeFolders))
             {
                 if (excludeExtensions.Contains(Path.GetExtension(filePath)))
                     continue;
 
-                // Mirror local structure: C:\Users\user\Doc\file.txt -> Users/user/Doc/file.txt
-                var relativePath = filePath;
-                if (relativePath.StartsWith(rootDrive, StringComparison.OrdinalIgnoreCase))
-                    relativePath = relativePath[rootDrive.Length..];
+                string b2FileName;
+                if (b2Override is not null)
+                {
+                    // Custom B2 root: replace local folder prefix with the override
+                    var relativeToFolder = Path.GetFullPath(filePath)[folderFullPath.Length..]
+                        .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    b2FileName = b2Override.TrimEnd('/') + "/" + relativeToFolder.Replace('\\', '/');
+                }
+                else
+                {
+                    // Mirror local structure: C:\Users\user\Doc\file.txt -> Users/user/Doc/file.txt
+                    var relativePath = filePath;
+                    if (relativePath.StartsWith(rootDrive, StringComparison.OrdinalIgnoreCase))
+                        relativePath = relativePath[rootDrive.Length..];
+                    b2FileName = relativePath.Replace('\\', '/');
+                }
 
-                var b2FileName = relativePath.Replace('\\', '/');
                 files.Add((filePath, b2FileName));
             }
         }
