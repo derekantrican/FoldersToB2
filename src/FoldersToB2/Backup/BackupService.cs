@@ -64,57 +64,72 @@ public class BackupService
             int uploaded = 0;
             int failed = 0;
             int skipped = 0;
+            int started = 0;
+            var manifestLock = new object();
+            var concurrency = Math.Max(1, _config.ConcurrentUploads);
 
-            for (int i = 0; i < changedFiles.Count; i++)
-            {
-                ct.ThrowIfCancellationRequested();
-                var (localPath, b2FileName) = changedFiles[i];
-
-                ProgressChanged?.Invoke(i + 1, changedFiles.Count);
-                StatusChanged?.Invoke($"Uploading {i + 1}/{changedFiles.Count}: {Path.GetFileName(localPath)}");
-
-                var fileProgress = new Progress<(long BytesUploaded, long TotalBytes)>(p =>
+            await Parallel.ForEachAsync(
+                changedFiles,
+                new ParallelOptions
                 {
-                    var pct = p.TotalBytes > 0 ? (double)p.BytesUploaded / p.TotalBytes * 100 : 0;
-                    var uploaded = FormatBytes(p.BytesUploaded);
-                    var total = FormatBytes(p.TotalBytes);
-                    StatusChanged?.Invoke($"Uploading {i + 1}/{changedFiles.Count}: {Path.GetFileName(localPath)} — {uploaded} / {total} ({pct:F1}%)");
-                });
-
-                try
+                    MaxDegreeOfParallelism = concurrency,
+                    CancellationToken = ct
+                },
+                async (item, token) =>
                 {
-                    var result = await UploadWithRetryAsync(b2, b2FileName, localPath, ct, progress: fileProgress);
+                    var (localPath, b2FileName) = item;
+                    var current = Interlocked.Increment(ref started);
 
-                    var fileInfo = new FileInfo(localPath);
-                    _manifest.UpsertRecord(new FileRecord
+                    ProgressChanged?.Invoke(current, changedFiles.Count);
+                    StatusChanged?.Invoke($"Uploading {current}/{changedFiles.Count}: {Path.GetFileName(localPath)}");
+
+                    var fileProgress = new Progress<(long BytesUploaded, long TotalBytes)>(p =>
                     {
-                        LocalPath = localPath,
-                        B2FileName = b2FileName,
-                        B2FileId = result.FileId,
-                        Sha256Hash = ComputeSha256(localPath),
-                        LastModifiedUtc = fileInfo.LastWriteTimeUtc,
-                        FileSize = fileInfo.Length,
-                        LastBackedUpUtc = DateTime.UtcNow
+                        var pct = p.TotalBytes > 0 ? (double)p.BytesUploaded / p.TotalBytes * 100 : 0;
+                        var uploadedBytes = FormatBytes(p.BytesUploaded);
+                        var total = FormatBytes(p.TotalBytes);
+                        StatusChanged?.Invoke($"Uploading {current}/{changedFiles.Count}: {Path.GetFileName(localPath)} — {uploadedBytes} / {total} ({pct:F1}%)");
                     });
 
-                    uploaded++;
-                    Log.Information("Uploaded: {Path} -> {B2Name}", localPath, b2FileName);
-                }
-                catch (IOException ex) when (IsFileLocked(ex))
-                {
-                    Log.Warning("Skipping locked file: {Path} - {Error}", localPath, ex.Message);
-                    skipped++;
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    Log.Error(ex, "Failed to upload: {Path}", localPath);
-                    failed++;
-                }
-            }
+                    try
+                    {
+                        var result = await UploadWithRetryAsync(b2, b2FileName, localPath, token, progress: fileProgress);
+
+                        var fileInfo = new FileInfo(localPath);
+                        var record = new FileRecord
+                        {
+                            LocalPath = localPath,
+                            B2FileName = b2FileName,
+                            B2FileId = result.FileId,
+                            Sha256Hash = ComputeSha256(localPath),
+                            LastModifiedUtc = fileInfo.LastWriteTimeUtc,
+                            FileSize = fileInfo.Length,
+                            LastBackedUpUtc = DateTime.UtcNow
+                        };
+
+                        lock (manifestLock)
+                        {
+                            _manifest.UpsertRecord(record);
+                        }
+
+                        Interlocked.Increment(ref uploaded);
+                        Log.Information("Uploaded: {Path} -> {B2Name}", localPath, b2FileName);
+                    }
+                    catch (IOException ex) when (IsFileLocked(ex))
+                    {
+                        Log.Warning("Skipping locked file: {Path} - {Error}", localPath, ex.Message);
+                        Interlocked.Increment(ref skipped);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error(ex, "Failed to upload: {Path}", localPath);
+                        Interlocked.Increment(ref failed);
+                    }
+                });
 
             var summary = skipped > 0
                 ? $"Uploaded {uploaded}, failed {failed}, skipped {skipped} locked of {changedFiles.Count} files"
