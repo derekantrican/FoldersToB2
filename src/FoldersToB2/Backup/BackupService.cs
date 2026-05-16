@@ -65,8 +65,24 @@ public class BackupService
             int failed = 0;
             int skipped = 0;
             int started = 0;
+            long totalBytesUploaded = 0;
+            var uploadStartedAt = DateTime.UtcNow;
             var manifestLock = new object();
             var concurrency = Math.Max(1, _config.ConcurrentUploads);
+
+            // Log throughput (eg MB/s) every 15 minutes for long-running uploads
+            using var throughputTimer = new System.Threading.Timer(_ =>
+            {
+                var elapsed = DateTime.UtcNow - uploadStartedAt;
+                if (elapsed.TotalMinutes < 15) return;
+
+                var bytes = Interlocked.Read(ref totalBytesUploaded);
+                var speed = bytes / elapsed.TotalSeconds;
+                Log.Information(
+                    "Upload throughput: {Rate} average over {Elapsed:F0} min ({Total} uploaded, {Done}/{Total2} files)",
+                    FormatBytes((long)speed) + "/s", elapsed.TotalMinutes, FormatBytes(bytes),
+                    uploaded + failed + skipped, changedFiles.Count);
+            }, null, TimeSpan.FromMinutes(15), TimeSpan.FromMinutes(15));
 
             await Parallel.ForEachAsync(
                 changedFiles,
@@ -112,6 +128,7 @@ public class BackupService
                             _manifest.UpsertRecord(record);
                         }
 
+                        Interlocked.Add(ref totalBytesUploaded, fileInfo.Length);
                         Interlocked.Increment(ref uploaded);
                         Log.Information("Uploaded: {Path} -> {B2Name}", localPath, b2FileName);
                     }
@@ -130,6 +147,15 @@ public class BackupService
                         Interlocked.Increment(ref failed);
                     }
                 });
+
+            var totalElapsed = DateTime.UtcNow - uploadStartedAt;
+            if (totalElapsed.TotalMinutes >= 15)
+            {
+                var avgSpeed = totalBytesUploaded / totalElapsed.TotalSeconds;
+                Log.Information(
+                    "Upload phase complete: {Total} in {Elapsed:F1} min ({Rate} average)",
+                    FormatBytes(totalBytesUploaded), totalElapsed.TotalMinutes, FormatBytes((long)avgSpeed) + "/s");
+            }
 
             var summary = skipped > 0
                 ? $"Uploaded {uploaded}, failed {failed}, skipped {skipped} locked of {changedFiles.Count} files"
