@@ -169,6 +169,17 @@ public class BackupService
             hadFailures = failed > 0;
         }
 
+        // Clean up files deleted locally
+        StatusChanged?.Invoke("Checking for deleted files...");
+        try
+        {
+            await CleanDeletedFilesAsync(b2, ct);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Failed to clean deleted files");
+        }
+
         // Clean up old versions
         StatusChanged?.Invoke("Cleaning old versions...");
         try
@@ -183,6 +194,43 @@ public class BackupService
 
         StatusChanged?.Invoke("Idle - last backup: " + DateTime.Now.ToString("g"));
         return !hadFailures;
+    }
+
+    private async Task CleanDeletedFilesAsync(B2Client b2, CancellationToken ct)
+    {
+        var allRecords = _manifest.GetAllRecords();
+        var orphans = allRecords.Where(r => !File.Exists(r.LocalPath)).ToList();
+
+        if (orphans.Count == 0)
+            return;
+
+        Log.Information("Found {Count} files deleted locally, removing from B2", orphans.Count);
+        int removed = 0;
+        int failed = 0;
+
+        foreach (var record in orphans)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            try
+            {
+                await b2.DeleteFileVersionAsync(record.B2FileName, record.B2FileId, ct);
+                _manifest.RemoveRecord(record.LocalPath);
+                removed++;
+                Log.Information("Deleted from B2: {B2Name}", record.B2FileName);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning("Failed to delete {B2Name} from B2: {Error}", record.B2FileName, ex.Message);
+                // Remove from manifest anyway — the file is gone locally and the B2 version
+                // will be cleaned up by the old version cleaner eventually
+                _manifest.RemoveRecord(record.LocalPath);
+                failed++;
+            }
+        }
+
+        Log.Information("Deleted file cleanup: {Removed} removed, {Failed} failed of {Total} orphaned files",
+            removed, failed, orphans.Count);
     }
 
     private List<(string LocalPath, string B2FileName)> ScanFiles()
