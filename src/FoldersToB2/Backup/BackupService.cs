@@ -433,11 +433,15 @@ public class BackupService
     {
         var changed = new List<(string, string)>();
 
+        // Bulk-load all manifest records into a dictionary for fast lookup
+        var manifestByPath = _manifest.GetAllRecords()
+            .ToDictionary(r => r.LocalPath, r => r, StringComparer.OrdinalIgnoreCase);
+
         foreach (var (localPath, b2FileName) in files)
         {
             try
             {
-                var record = _manifest.GetRecord(localPath);
+                manifestByPath.TryGetValue(localPath, out var record);
                 var fileInfo = new FileInfo(localPath);
 
                 if (record is null)
