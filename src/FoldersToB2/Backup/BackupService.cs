@@ -233,8 +233,11 @@ public class BackupService
             removed, failed, orphans.Count);
     }
 
+    private Dictionary<string, (long Size, DateTime LastWriteUtc)> _scanMetadata = new(StringComparer.OrdinalIgnoreCase);
+
     private List<(string LocalPath, string B2FileName)> ScanFiles()
     {
+        _scanMetadata.Clear();
         var files = new List<(string, string)>();
 
         // Add individual files
@@ -285,16 +288,18 @@ public class BackupService
             var rootDrive = Path.GetPathRoot(folder) ?? "";
             var folderFullPath = Path.GetFullPath(folder);
 
-            foreach (var filePath in EnumerateFilesSafe(folder, excludeFolders))
+            foreach (var fileInfo in EnumerateFileInfoSafe(folder, excludeFolders))
             {
-                if (excludeExtensions.Contains(Path.GetExtension(filePath)))
+                var filePath = fileInfo.FullName;
+
+                if (excludeExtensions.Contains(fileInfo.Extension))
                     continue;
 
                 string b2FileName;
                 if (b2Override is not null)
                 {
                     // Custom B2 root: replace local folder prefix with the override
-                    var relativeToFolder = Path.GetFullPath(filePath)[folderFullPath.Length..]
+                    var relativeToFolder = filePath[folderFullPath.Length..]
                         .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                     b2FileName = b2Override.TrimEnd('/') + "/" + relativeToFolder.Replace('\\', '/');
                 }
@@ -308,6 +313,7 @@ public class BackupService
                 }
 
                 files.Add((filePath, b2FileName));
+                _scanMetadata[filePath] = (fileInfo.Length, fileInfo.LastWriteTimeUtc);
             }
         }
 
@@ -380,12 +386,23 @@ public class BackupService
         return result;
     }
 
-    private static IEnumerable<string> EnumerateFilesSafe(string directory, HashSet<string> excludeFolders)
+    private static IEnumerable<FileInfo> EnumerateFileInfoSafe(string directory, HashSet<string> excludeFolders)
     {
-        IEnumerable<string> files;
+        DirectoryInfo dirInfo;
         try
         {
-            files = Directory.EnumerateFiles(directory);
+            dirInfo = new DirectoryInfo(directory);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning("Error scanning {Directory}: {Error}", directory, ex.Message);
+            yield break;
+        }
+
+        IEnumerable<FileInfo> files;
+        try
+        {
+            files = dirInfo.EnumerateFiles();
         }
         catch (UnauthorizedAccessException)
         {
@@ -401,10 +418,10 @@ public class BackupService
         foreach (var file in files)
             yield return file;
 
-        IEnumerable<string> subdirs;
+        IEnumerable<DirectoryInfo> subdirs;
         try
         {
-            subdirs = Directory.EnumerateDirectories(directory);
+            subdirs = dirInfo.EnumerateDirectories();
         }
         catch
         {
@@ -413,11 +430,10 @@ public class BackupService
 
         foreach (var subdir in subdirs)
         {
-            var dirName = Path.GetFileName(subdir);
-            if (excludeFolders.Contains(dirName))
+            if (excludeFolders.Contains(subdir.Name))
                 continue;
 
-            foreach (var file in EnumerateFilesSafe(subdir, excludeFolders))
+            foreach (var file in EnumerateFileInfoSafe(subdir.FullName, excludeFolders))
                 yield return file;
         }
     }
@@ -437,12 +453,20 @@ public class BackupService
         var manifestByPath = _manifest.GetAllRecords()
             .ToDictionary(r => r.LocalPath, r => r, StringComparer.OrdinalIgnoreCase);
 
+        int checked_ = 0;
+        int hashed = 0;
+        int skippedFast = 0;
+
         foreach (var (localPath, b2FileName) in files)
         {
             try
             {
+                checked_++;
+                if (checked_ % 100_000 == 0)
+                    Log.Information("Change detection progress: {Checked}/{Total} checked, {Changed} changed, {Hashed} hashed, {Skipped} skipped",
+                        checked_, files.Count, changed.Count, hashed, skippedFast);
+
                 manifestByPath.TryGetValue(localPath, out var record);
-                var fileInfo = new FileInfo(localPath);
 
                 if (record is null)
                 {
@@ -451,12 +475,31 @@ public class BackupService
                     continue;
                 }
 
+                // Use pre-captured metadata from scan if available, avoiding per-file stat calls
+                long fileSize;
+                DateTime lastWriteUtc;
+                if (_scanMetadata.TryGetValue(localPath, out var meta))
+                {
+                    fileSize = meta.Size;
+                    lastWriteUtc = meta.LastWriteUtc;
+                }
+                else
+                {
+                    var fileInfo = new FileInfo(localPath);
+                    fileSize = fileInfo.Length;
+                    lastWriteUtc = fileInfo.LastWriteTimeUtc;
+                }
+
                 // Quick check: if size and last-modified are identical, skip
-                if (record.FileSize == fileInfo.Length &&
-                    record.LastModifiedUtc == fileInfo.LastWriteTimeUtc)
+                if (record.FileSize == fileSize &&
+                    record.LastModifiedUtc == lastWriteUtc)
+                {
+                    skippedFast++;
                     continue;
+                }
 
                 // Size or timestamp changed - verify with SHA256
+                hashed++;
                 var currentHash = ComputeSha256(localPath);
                 if (currentHash != record.Sha256Hash)
                     changed.Add((localPath, b2FileName));

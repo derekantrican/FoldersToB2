@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.Data.Sqlite;
 
 namespace FoldersToB2.Backup;
@@ -100,9 +101,9 @@ public class FileManifest : IDisposable
             B2FileName = reader.GetString(1),
             B2FileId = reader.GetString(2),
             Sha256Hash = reader.GetString(3),
-            LastModifiedUtc = DateTime.Parse(reader.GetString(4)),
+            LastModifiedUtc = DateTime.Parse(reader.GetString(4), null, DateTimeStyles.RoundtripKind),
             FileSize = reader.GetInt64(5),
-            LastBackedUpUtc = DateTime.Parse(reader.GetString(6))
+            LastBackedUpUtc = DateTime.Parse(reader.GetString(6), null, DateTimeStyles.RoundtripKind)
         };
     }
 
