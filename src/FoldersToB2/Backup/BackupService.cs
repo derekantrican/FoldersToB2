@@ -198,8 +198,47 @@ public class BackupService
 
     private async Task CleanDeletedFilesAsync(B2Client b2, CancellationToken ct)
     {
+        // Build set of configured root paths (folders and individual file directories)
+        // to detect when a drive/folder is disconnected vs. files truly deleted
+        var configuredRoots = new List<string>();
+        foreach (var folderEntry in _config.Folders)
+        {
+            var (folder, _) = Config.PathEntry.Parse(folderEntry);
+            configuredRoots.Add(Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar);
+        }
+        
+        foreach (var fileEntry in _config.Files)
+        {
+            var (filePath, _) = Config.PathEntry.Parse(fileEntry);
+            var dir = Path.GetDirectoryName(Path.GetFullPath(filePath));
+            if (dir is not null)
+                configuredRoots.Add(dir.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar);
+        }
+
+        // Check which roots are unreachable (drive disconnected, network share down, etc.)
+        var unreachableRoots = configuredRoots.Where(r => !Directory.Exists(Path.GetDirectoryName(r.TrimEnd(Path.DirectorySeparatorChar))!)).ToList();
+        if (unreachableRoots.Count > 0)
+        {
+            Log.Warning("Skipping deleted-file cleanup for {Count} unreachable paths: {Paths}",
+                unreachableRoots.Count, string.Join(", ", unreachableRoots));
+        }
+
         var allRecords = _manifest.GetAllRecords();
-        var orphans = allRecords.Where(r => !File.Exists(r.LocalPath)).ToList();
+        var orphans = allRecords.Where(r =>
+        {
+            if (File.Exists(r.LocalPath))
+                return false;
+
+            // If the file's configured root is unreachable, don't treat it as deleted
+            var fullPath = Path.GetFullPath(r.LocalPath);
+            foreach (var root in unreachableRoots)
+            {
+                if (fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+
+            return true;
+        }).ToList();
 
         if (orphans.Count == 0)
             return;
